@@ -20,13 +20,20 @@ class ScholarshipsAdsScraper(BaseScraper):
         for page_path in self.PAGES:
             try:
                 url = f"{self.BASE}{page_path}" if not page_path.startswith("http") else page_path
+
+                if not self.is_page_fresh(url):
+                    log.debug("Skipping %s (already scraped)", url)
+                    continue
+
                 resp = self.polite_get(session, url)
                 soup = BeautifulSoup(resp.text, "lxml")
 
+                count = 0
                 for article in soup.select("article, .post, .entry, .type-post, .blog-item, .card"):
                     opp = self._parse_article(article)
                     if opp and not any(r.url == opp.url for r in results):
                         results.append(opp)
+                        count += 1
 
                 for link in soup.select("a[href*='scholarship'], a[href*='fully-funded']"):
                     href = link.get("href", "")
@@ -40,6 +47,9 @@ class ScholarshipsAdsScraper(BaseScraper):
                             source=self.name,
                             raw_categories=["student_scholarships"],
                         ))
+                        count += 1
+
+                self.mark_page_done(url, count)
 
             except Exception as e:
                 log.error("scholarshipsads %s error: %s", page_path, e)

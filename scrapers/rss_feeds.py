@@ -23,6 +23,10 @@ class RSSFeedScraper(BaseScraper):
     def scrape(self) -> list[Opportunity]:
         results = []
         for feed_url, source in RSS_FEEDS:
+            if not self.is_page_fresh(feed_url):
+                log.debug("Skipping RSS %s (already scraped)", source)
+                continue
+
             try:
                 resp = requests.get(
                     feed_url,
@@ -32,6 +36,7 @@ class RSSFeedScraper(BaseScraper):
                 root = ElementTree.fromstring(resp.content)
                 ns = {"atom": "http://www.w3.org/2005/Atom"}
                 items = root.findall(".//item") or root.findall(".//atom:entry", ns)
+                count = 0
                 for item in items:
                     title = item.findtext("title") or item.findtext("atom:title", namespaces=ns) or ""
                     link_el = item.find("link")
@@ -49,6 +54,8 @@ class RSSFeedScraper(BaseScraper):
                         source=source,
                         description=strip_tags(desc)[:500],
                     ))
+                    count += 1
+                self.mark_page_done(feed_url, count)
             except Exception as e:
                 log.error("RSS feed %s error: %s", feed_url, e)
         return results

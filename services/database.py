@@ -45,6 +45,20 @@ def init_db():
 
         CREATE INDEX IF NOT EXISTS idx_opp_category ON opportunities(category);
         CREATE INDEX IF NOT EXISTS idx_opp_sent ON opportunities(sent_to_channel);
+        CREATE INDEX IF NOT EXISTS idx_opp_url ON opportunities(url);
+
+        CREATE TABLE IF NOT EXISTS scraped_pages (
+            page_hash TEXT PRIMARY KEY,
+            source TEXT,
+            url TEXT,
+            scraped_at REAL,
+            item_count INTEGER DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS known_urls (
+            url_hash TEXT PRIMARY KEY,
+            added_at REAL
+        );
     """)
     # Add columns if upgrading from old schema
     try:
@@ -171,3 +185,86 @@ def get_opportunities_by_category(category: str, limit: int = 5) -> list[dict]:
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+# ─── DEDUP: zero-memory knowledge base stored in SQLite ───
+
+import hashlib
+
+
+def _hash(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()[:20]
+
+
+def url_already_known(url: str) -> bool:
+    h = _hash(url)
+    conn = get_conn()
+    row = conn.execute("SELECT 1 FROM known_urls WHERE url_hash = ?", (h,)).fetchone()
+    conn.close()
+    return row is not None
+
+
+def mark_url_known(url: str):
+    h = _hash(url)
+    conn = get_conn()
+    conn.execute("INSERT OR IGNORE INTO known_urls (url_hash, added_at) VALUES (?, ?)", (h, time.time()))
+    conn.commit()
+    conn.close()
+
+
+def bulk_check_urls(urls: list[str]) -> set[str]:
+    """Return set of URLs that are already known. Single DB query."""
+    if not urls:
+        return set()
+    hashes = {_hash(u): u for u in urls}
+    conn = get_conn()
+    placeholders = ",".join("?" * len(hashes))
+    rows = conn.execute(
+        f"SELECT url_hash FROM known_urls WHERE url_hash IN ({placeholders})",
+        list(hashes.keys())
+    ).fetchall()
+    conn.close()
+    known_hashes = {r[0] for r in rows}
+    return {hashes[h] for h in known_hashes if h in hashes}
+
+
+def bulk_mark_urls(urls: list[str]):
+    if not urls:
+        return
+    now = time.time()
+    conn = get_conn()
+    conn.executemany(
+        "INSERT OR IGNORE INTO known_urls (url_hash, added_at) VALUES (?, ?)",
+        [(_hash(u), now) for u in urls]
+    )
+    conn.commit()
+    conn.close()
+
+
+def page_already_scraped(source: str, page_url: str, max_age_hours: int = 1) -> bool:
+    h = _hash(f"{source}:{page_url}")
+    conn = get_conn()
+    row = conn.execute("SELECT scraped_at FROM scraped_pages WHERE page_hash = ?", (h,)).fetchone()
+    conn.close()
+    if not row:
+        return False
+    return (time.time() - row[0]) < (max_age_hours * 3600)
+
+
+def mark_page_scraped(source: str, page_url: str, item_count: int = 0):
+    h = _hash(f"{source}:{page_url}")
+    conn = get_conn()
+    conn.execute(
+        "INSERT OR REPLACE INTO scraped_pages (page_hash, source, url, scraped_at, item_count) VALUES (?, ?, ?, ?, ?)",
+        (h, source, page_url, time.time(), item_count)
+    )
+    conn.commit()
+    conn.close()
+
+
+def cleanup_old_page_records(max_age_hours: int = 24):
+    cutoff = time.time() - (max_age_hours * 3600)
+    conn = get_conn()
+    conn.execute("DELETE FROM scraped_pages WHERE scraped_at < ?", (cutoff,))
+    conn.commit()
+    conn.close()

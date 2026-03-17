@@ -59,5 +59,14 @@ class BaseScraper:
         resp.raise_for_status()
         return resp
 
+    def is_page_fresh(self, page_url: str) -> bool:
+        """Check if this page was already scraped within the last hour."""
+        from services.database import page_already_scraped
+        return not page_already_scraped(self.name, page_url, max_age_hours=1)
+
+    def mark_page_done(self, page_url: str, count: int = 0):
+        from services.database import mark_page_scraped
+        mark_page_scraped(self.name, page_url, count)
+
     def scrape(self) -> list[Opportunity]:
         raise NotImplementedError

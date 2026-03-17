@@ -24,17 +24,26 @@ class AfterSchoolAfricaScraper(BaseScraper):
                     if page_num > 1:
                         url = f"{url}page/{page_num}/"
 
+                    if not self.is_page_fresh(url):
+                        log.debug("Skipping %s (already scraped)", url)
+                        break
+
                     resp = self.polite_get(session, url)
                     soup = BeautifulSoup(resp.text, "lxml")
                     articles = soup.select("article, .post, .entry, .type-post")
 
                     if not articles:
+                        self.mark_page_done(url, 0)
                         break
 
+                    count = 0
                     for article in articles:
                         opp = self._parse_article(article)
                         if opp and not any(r.url == opp.url for r in results):
                             results.append(opp)
+                            count += 1
+
+                    self.mark_page_done(url, count)
 
                     if not soup.select("a.next, .next.page-numbers"):
                         break

@@ -24,13 +24,19 @@ class FundsForNGOsScraper(BaseScraper):
                     if page_num > 1:
                         url = f"{url}page/{page_num}/"
 
+                    if not self.is_page_fresh(url):
+                        log.debug("Skipping %s (already scraped)", url)
+                        break
+
                     resp = self.polite_get(session, url)
                     soup = BeautifulSoup(resp.text, "lxml")
 
                     articles = soup.select("article, .post, .entry, .listing-item, .type-post")
                     if not articles:
+                        self.mark_page_done(url, 0)
                         break
 
+                    count = 0
                     for article in articles[:20]:
                         title_el = article.select_one("h2 a, h3 a, .entry-title a, a.title")
                         if not title_el:
@@ -55,6 +61,9 @@ class FundsForNGOsScraper(BaseScraper):
                             description=desc[:2000],
                             raw_categories=["nonprofit_funding"],
                         ))
+                        count += 1
+
+                    self.mark_page_done(url, count)
 
                     if not soup.select("a.next, .next.page-numbers"):
                         break

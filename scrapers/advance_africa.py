@@ -24,9 +24,15 @@ class AdvanceAfricaScraper(BaseScraper):
         for page_path in self.PAGES:
             try:
                 url = f"{self.BASE}{page_path}"
+
+                if not self.is_page_fresh(url):
+                    log.debug("Skipping %s (already scraped)", url)
+                    continue
+
                 resp = self.polite_get(session, url)
                 soup = BeautifulSoup(resp.text, "lxml")
 
+                count = 0
                 for link in soup.select("a[href]"):
                     href = link.get("href", "")
                     title = link.get_text(strip=True)
@@ -63,6 +69,9 @@ class AdvanceAfricaScraper(BaseScraper):
                         host_country=host,
                         raw_categories=["student_scholarships"],
                     ))
+                    count += 1
+
+                self.mark_page_done(url, count)
 
             except Exception as e:
                 log.error("advance-africa %s error: %s", page_path, e)

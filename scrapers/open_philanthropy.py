@@ -11,10 +11,15 @@ class OpenPhilanthropyScraper(BaseScraper):
     BASE = "https://www.openphilanthropy.org"
 
     def scrape(self) -> list[Opportunity]:
+        url = f"{self.BASE}/grants/"
+        if not self.is_page_fresh(url):
+            log.debug("Skipping openphilanthropy (already scraped)")
+            return []
+
         results = []
         try:
             resp = requests.get(
-                f"{self.BASE}/grants/",
+                url,
                 headers={"User-Agent": "Mozilla/5.0 (compatible; GrantsBot/1.0)"},
                 timeout=30,
             )
@@ -42,6 +47,7 @@ class OpenPhilanthropyScraper(BaseScraper):
                     amount=amount_el.get_text(strip=True) if amount_el else "",
                     raw_categories=["nonprofit_funding"],
                 ))
+            self.mark_page_done(url, len(results))
         except Exception as e:
             log.error("openphilanthropy scrape error: %s", e)
         return results
