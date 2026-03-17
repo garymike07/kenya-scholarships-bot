@@ -211,11 +211,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     register_user(user.id, user.username or "")
     text = update.message.text.strip()
+    log.info("Message from %s (%s): %s", user.first_name, user.id, text[:100])
 
     if not text:
         return
 
-    await context.bot.send_chat_action(update.message.chat_id, "typing")
+    try:
+        await context.bot.send_chat_action(update.message.chat_id, "typing")
+    except Exception:
+        pass
 
     history = context.user_data.get("chat_history", [])
     if not history:
@@ -319,7 +323,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not actions_done:
         clean_response = re.sub(r'\[.*?\]', '', clean_response).strip()
         if clean_response:
-            await send_full_message(context.bot, update.message.chat_id, escape(clean_response))
+            try:
+                await send_full_message(context.bot, update.message.chat_id, escape(clean_response))
+            except Exception as e:
+                log.error("Failed to send response: %s", e)
+                try:
+                    await update.message.reply_text(clean_response[:4000])
+                except Exception:
+                    pass
 
 
 async def _async_extract_resume_data(history: list[dict]) -> dict:
@@ -403,9 +414,14 @@ async def post_to_channel(app: Application):
 
 # ─── BUILD APP ───
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    log.error("Bot error: %s", context.error, exc_info=context.error)
+
+
 def build_app() -> Application:
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CallbackQueryHandler(resume_callback, pattern=r"^resume:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_error_handler(error_handler)
     return app

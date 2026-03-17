@@ -1,7 +1,6 @@
 """
 AI engine with multi-account OpenRouter key rotation.
-Each key gets all 26 free models. When one key is rate limited, it moves to the next.
-Add more keys to OPENROUTER_API_KEYS in .env (comma-separated) for more capacity.
+Key 1 = chat, Key 2 = scraper, Key 3+ = overflow. All fallback to each other.
 """
 import httpx
 import asyncio
@@ -15,41 +14,35 @@ log = logging.getLogger(__name__)
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 FREE_MODELS = [
-    "nvidia/nemotron-3-super-120b-a12b:free",
     "meta-llama/llama-3.3-70b-instruct:free",
     "google/gemma-3-27b-it:free",
-    "qwen/qwen3-next-80b-a3b-instruct:free",
-    "nousresearch/hermes-3-llama-3.1-405b:free",
-    "openai/gpt-oss-120b:free",
     "mistralai/mistral-small-3.1-24b-instruct:free",
-    "minimax/minimax-m2.5:free",
     "nvidia/nemotron-3-nano-30b-a3b:free",
-    "stepfun/step-3.5-flash:free",
-    "openrouter/free",
-    "arcee-ai/trinity-large-preview:free",
-    "z-ai/glm-4.5-air:free",
-    "cognitivecomputations/dolphin-mistral-24b-venice-edition:free",
-    "google/gemma-3-12b-it:free",
-    "qwen/qwen3-coder:free",
-    "openai/gpt-oss-20b:free",
-    "nvidia/nemotron-nano-12b-v2-vl:free",
-    "google/gemma-3-4b-it:free",
     "qwen/qwen3-4b:free",
     "meta-llama/llama-3.2-3b-instruct:free",
-    "arcee-ai/trinity-mini:free",
-    "nvidia/nemotron-nano-9b-v2:free",
+    "google/gemma-3-12b-it:free",
+    "google/gemma-3-4b-it:free",
     "google/gemma-3n-e4b-it:free",
     "google/gemma-3n-e2b-it:free",
+    "nvidia/nemotron-nano-9b-v2:free",
+    "arcee-ai/trinity-large-preview:free",
+    "arcee-ai/trinity-mini:free",
     "liquid/lfm-2.5-1.2b-instruct:free",
+    "cognitivecomputations/dolphin-mistral-24b-venice-edition:free",
+    "z-ai/glm-4.5-air:free",
+    "qwen/qwen3-coder:free",
 ]
 
-# Track rate limits per (key, model) pair
-_rate_limited = {}
+# Rate limit tracking: key -> expiry time (entire key blocked)
+_key_limited = {}
+# Per (key:model) tracking for 404s / broken models
+_broken = {}
 _lock = threading.Lock()
 
-# Assign keys: first key = chat, second key = scraper, both fallback to each other
+# Scraper ONLY uses the last key; chat uses all keys (scraper can't starve chat)
+_num_keys = len(OPENROUTER_API_KEYS)
 _chat_key_idx = 0
-_scraper_key_idx = min(1, len(OPENROUTER_API_KEYS) - 1) if OPENROUTER_API_KEYS else 0
+_scraper_key_idx = max(0, _num_keys - 1)
 
 SYSTEM_PROMPT = """You are an AI assistant inside a Telegram bot for Kenyan citizens. You help with TWO things:
 
@@ -72,106 +65,126 @@ HOW TO BEHAVE:
 IMPORTANT: You MUST use the tags above when appropriate. They trigger actions in the bot."""
 
 
-def _is_available(key: str, model: str) -> bool:
-    return _rate_limited.get(f"{key}:{model}", 0) < time.time()
+def _key_available(key: str) -> bool:
+    return _key_limited.get(key, 0) < time.time()
 
 
-def _mark_limited(key: str, model: str):
+def _model_broken(key: str, model: str) -> bool:
+    return _broken.get(f"{key}:{model}", 0) > time.time()
+
+
+def _mark_key_limited(key: str, duration: int = 60):
     with _lock:
-        _rate_limited[f"{key}:{model}"] = time.time() + 90
-    log.warning("Rate limited key=...%s model=%s", key[-8:], model.split("/")[-1])
+        _key_limited[key] = time.time() + duration
+    log.warning("Key ...%s rate limited for %ds", key[-8:], duration)
 
 
-def _try_request_sync(key: str, model: str, messages: list, max_tokens: int, temperature: float) -> str | None:
-    try:
-        with httpx.Client(timeout=60) as client:
-            resp = client.post(
-                OPENROUTER_URL,
-                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                json={"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature},
-            )
-            if resp.status_code == 429:
-                _mark_limited(key, model)
-                return None
-            resp.raise_for_status()
-            data = resp.json()
-            content = data.get("choices", [{}])[0].get("message", {}).get("content")
-            if content:
-                return content.strip()
-            _mark_limited(key, model)
-    except Exception as e:
-        log.error("AI error key=...%s model=%s: %s", key[-8:], model.split("/")[-1], e)
-        _mark_limited(key, model)
-    return None
+def _mark_model_broken(key: str, model: str):
+    with _lock:
+        _broken[f"{key}:{model}"] = time.time() + 3600
 
 
-async def _try_request_async(key: str, model: str, messages: list, max_tokens: int, temperature: float) -> str | None:
-    try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.post(
-                OPENROUTER_URL,
-                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                json={"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature},
-            )
-            if resp.status_code == 429:
-                _mark_limited(key, model)
-                return None
-            resp.raise_for_status()
-            data = resp.json()
-            content = data.get("choices", [{}])[0].get("message", {}).get("content")
-            if content:
-                return content.strip()
-            _mark_limited(key, model)
-    except Exception as e:
-        log.error("AI error key=...%s model=%s: %s", key[-8:], model.split("/")[-1], e)
-        _mark_limited(key, model)
-    return None
+def _get_key_order(primary_idx: int) -> list[str]:
+    if not OPENROUTER_API_KEYS:
+        return []
+    order = [OPENROUTER_API_KEYS[primary_idx % len(OPENROUTER_API_KEYS)]]
+    for k in OPENROUTER_API_KEYS:
+        if k not in order:
+            order.append(k)
+    return order
 
 
 async def async_chat_completion(messages: list[dict], max_tokens: int = 800) -> str:
-    """Non-blocking AI for user chat. Tries primary chat key first, then all other keys."""
     if not OPENROUTER_API_KEYS:
         return "AI is not configured."
 
-    # Build key order: chat key first, then all others
-    key_order = [OPENROUTER_API_KEYS[_chat_key_idx]]
-    for k in OPENROUTER_API_KEYS:
-        if k not in key_order:
-            key_order.append(k)
+    key_order = _get_key_order(_chat_key_idx)
 
     for key in key_order:
-        for model in FREE_MODELS:
-            if not _is_available(key, model):
-                continue
-            result = await _try_request_async(key, model, messages, max_tokens, 0.7)
-            if result:
-                log.info("Chat response from key=...%s model=%s", key[-8:], model.split("/")[-1])
-                return result
-            await asyncio.sleep(0.3)
+        if not _key_available(key):
+            continue
 
-    return ("All AI models are cooling down right now. "
-            "Please try again in about a minute -- I rotate through many models and accounts!")
+        hits_429 = 0
+        for model in FREE_MODELS:
+            if _model_broken(key, model):
+                continue
+            try:
+                async with httpx.AsyncClient(timeout=30) as client:
+                    resp = await client.post(
+                        OPENROUTER_URL,
+                        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                        json={"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": 0.7},
+                    )
+                if resp.status_code == 429:
+                    hits_429 += 1
+                    if hits_429 >= 3:
+                        _mark_key_limited(key, 60)
+                        break
+                    continue
+                if resp.status_code == 402:
+                    _mark_key_limited(key, 86400)
+                    break
+                if resp.status_code == 404:
+                    _mark_model_broken(key, model)
+                    continue
+                if resp.status_code >= 400:
+                    continue
+                data = resp.json()
+                content = data.get("choices", [{}])[0].get("message", {}).get("content")
+                if content:
+                    log.info("Chat OK key=...%s model=%s", key[-8:], model.split("/")[-1])
+                    return content.strip()
+            except Exception as e:
+                log.error("Chat error key=...%s model=%s: %s", key[-8:], model.split("/")[-1], e)
+                continue
+
+    return ("All AI models are cooling down. Please try again in about a minute!")
 
 
 def chat_completion(messages: list[dict], max_tokens: int = 800) -> str:
-    """Blocking AI for scraper thread. Tries scraper key first, then all others."""
+    """Scraper AI -- uses ONLY its dedicated key, never touches chat keys."""
     if not OPENROUTER_API_KEYS:
         return ""
 
     key_order = [OPENROUTER_API_KEYS[_scraper_key_idx]]
-    for k in OPENROUTER_API_KEYS:
-        if k not in key_order:
-            key_order.append(k)
 
     for key in key_order:
+        if not _key_available(key):
+            continue
+
+        hits_429 = 0
         for model in FREE_MODELS:
-            if not _is_available(key, model):
+            if _model_broken(key, model):
                 continue
-            result = _try_request_sync(key, model, messages, max_tokens, 0.3)
-            if result:
-                log.info("Scraper response from key=...%s model=%s", key[-8:], model.split("/")[-1])
-                return result
-            time.sleep(0.5)
+            try:
+                with httpx.Client(timeout=30) as client:
+                    resp = client.post(
+                        OPENROUTER_URL,
+                        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                        json={"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": 0.3},
+                    )
+                if resp.status_code == 429:
+                    hits_429 += 1
+                    if hits_429 >= 3:
+                        _mark_key_limited(key, 60)
+                        break
+                    continue
+                if resp.status_code == 402:
+                    _mark_key_limited(key, 86400)
+                    break
+                if resp.status_code == 404:
+                    _mark_model_broken(key, model)
+                    continue
+                if resp.status_code >= 400:
+                    continue
+                data = resp.json()
+                content = data.get("choices", [{}])[0].get("message", {}).get("content")
+                if content:
+                    log.info("Scraper OK key=...%s model=%s", key[-8:], model.split("/")[-1])
+                    return content.strip()
+            except Exception as e:
+                log.error("Scraper error key=...%s model=%s: %s", key[-8:], model.split("/")[-1], e)
+                continue
 
     return ""
 
