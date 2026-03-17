@@ -5,6 +5,7 @@ No long-running process needed.
 """
 import sys
 import os
+import signal
 import asyncio
 import logging
 
@@ -16,6 +17,13 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+MAX_RUNTIME_SECONDS = 50 * 60  # 50 minutes safety margin
+
+
+def timeout_handler(signum, frame):
+    log.warning("Reached max runtime, moving to post phase...")
+    raise TimeoutError("Max runtime reached")
+
 
 async def main():
     from services.database import init_db
@@ -26,8 +34,15 @@ async def main():
     init_db()
 
     log.info("Running scrape cycle...")
-    new_count = run_scrape_cycle()
-    log.info("Scraped %d new opportunities", new_count)
+    signal.signal(signal.SIGALRM, timeout_handler)
+    signal.alarm(MAX_RUNTIME_SECONDS - 300)  # Leave 5 min for posting
+    try:
+        new_count = run_scrape_cycle()
+        log.info("Scraped %d new opportunities", new_count)
+    except TimeoutError:
+        log.warning("Scrape cycle cut short by timeout, posting what we have...")
+    finally:
+        signal.alarm(0)
 
     log.info("Posting to Telegram channel...")
     app = build_app()
