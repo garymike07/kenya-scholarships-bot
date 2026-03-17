@@ -3,7 +3,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+OPENROUTER_API_KEYS = [
+    k.strip() for k in os.getenv("OPENROUTER_API_KEYS", "").split(",") if k.strip()
+]
+OPENROUTER_API_KEY = OPENROUTER_API_KEYS[0] if OPENROUTER_API_KEYS else os.getenv("OPENROUTER_API_KEY", "")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHANNEL_ID = int(os.getenv("TELEGRAM_CHANNEL_ID", "0"))
 DB_PATH = os.path.join(os.path.dirname(__file__), "data", "grants.db")

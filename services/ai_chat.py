@@ -1,19 +1,20 @@
 """
-AI engine with separate model pools for chat (priority) and scraper (background).
+AI engine with multi-account OpenRouter key rotation.
+Each key gets all 26 free models. When one key is rate limited, it moves to the next.
+Add more keys to OPENROUTER_API_KEYS in .env (comma-separated) for more capacity.
 """
 import httpx
 import asyncio
 import time
 import threading
 import logging
-from config import OPENROUTER_API_KEY
+from config import OPENROUTER_API_KEYS
 
 log = logging.getLogger(__name__)
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-# Chat gets the best models -- these are reserved for user-facing interactions
-CHAT_MODELS = [
+FREE_MODELS = [
     "nvidia/nemotron-3-super-120b-a12b:free",
     "meta-llama/llama-3.3-70b-instruct:free",
     "google/gemma-3-27b-it:free",
@@ -42,22 +43,13 @@ CHAT_MODELS = [
     "liquid/lfm-2.5-1.2b-instruct:free",
 ]
 
-# Scraper uses a small subset so it doesn't exhaust all models
-SCRAPER_MODELS = [
-    "qwen/qwen3-4b:free",
-    "meta-llama/llama-3.2-3b-instruct:free",
-    "google/gemma-3-4b-it:free",
-    "google/gemma-3n-e4b-it:free",
-    "liquid/lfm-2.5-1.2b-instruct:free",
-    "arcee-ai/trinity-mini:free",
-    "nvidia/nemotron-nano-9b-v2:free",
-    "google/gemma-3n-e2b-it:free",
-]
-
-_chat_idx = 0
-_scraper_idx = 0
+# Track rate limits per (key, model) pair
 _rate_limited = {}
 _lock = threading.Lock()
+
+# Assign keys: first key = chat, second key = scraper, both fallback to each other
+_chat_key_idx = 0
+_scraper_key_idx = min(1, len(OPENROUTER_API_KEYS) - 1) if OPENROUTER_API_KEYS else 0
 
 SYSTEM_PROMPT = """You are an AI assistant inside a Telegram bot for Kenyan citizens. You help with TWO things:
 
@@ -80,125 +72,106 @@ HOW TO BEHAVE:
 IMPORTANT: You MUST use the tags above when appropriate. They trigger actions in the bot."""
 
 
-def _get_next_model(models: list, idx_name: str) -> tuple[str | None, int]:
-    global _chat_idx, _scraper_idx
-    now = time.time()
-    with _lock:
-        idx = _chat_idx if idx_name == "chat" else _scraper_idx
-        for _ in range(len(models)):
-            model = models[idx % len(models)]
-            if _rate_limited.get(model, 0) < now:
-                return model, idx
-            idx = (idx + 1) % len(models)
-        if idx_name == "chat":
-            _chat_idx = idx
-        else:
-            _scraper_idx = idx
-    return None, idx
+def _is_available(key: str, model: str) -> bool:
+    return _rate_limited.get(f"{key}:{model}", 0) < time.time()
 
 
-def _mark_limited(model: str, idx_name: str):
-    global _chat_idx, _scraper_idx
+def _mark_limited(key: str, model: str):
     with _lock:
-        _rate_limited[model] = time.time() + 90
-        if idx_name == "chat":
-            _chat_idx = (_chat_idx + 1) % len(CHAT_MODELS)
-        else:
-            _scraper_idx = (_scraper_idx + 1) % len(SCRAPER_MODELS)
-    log.warning("Rate limited %s, rotating", model)
+        _rate_limited[f"{key}:{model}"] = time.time() + 90
+    log.warning("Rate limited key=...%s model=%s", key[-8:], model.split("/")[-1])
+
+
+def _try_request_sync(key: str, model: str, messages: list, max_tokens: int, temperature: float) -> str | None:
+    try:
+        with httpx.Client(timeout=60) as client:
+            resp = client.post(
+                OPENROUTER_URL,
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                json={"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature},
+            )
+            if resp.status_code == 429:
+                _mark_limited(key, model)
+                return None
+            resp.raise_for_status()
+            data = resp.json()
+            content = data.get("choices", [{}])[0].get("message", {}).get("content")
+            if content:
+                return content.strip()
+            _mark_limited(key, model)
+    except Exception as e:
+        log.error("AI error key=...%s model=%s: %s", key[-8:], model.split("/")[-1], e)
+        _mark_limited(key, model)
+    return None
+
+
+async def _try_request_async(key: str, model: str, messages: list, max_tokens: int, temperature: float) -> str | None:
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(
+                OPENROUTER_URL,
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                json={"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature},
+            )
+            if resp.status_code == 429:
+                _mark_limited(key, model)
+                return None
+            resp.raise_for_status()
+            data = resp.json()
+            content = data.get("choices", [{}])[0].get("message", {}).get("content")
+            if content:
+                return content.strip()
+            _mark_limited(key, model)
+    except Exception as e:
+        log.error("AI error key=...%s model=%s: %s", key[-8:], model.split("/")[-1], e)
+        _mark_limited(key, model)
+    return None
 
 
 async def async_chat_completion(messages: list[dict], max_tokens: int = 800) -> str:
-    """Non-blocking AI for Telegram bot handlers. Uses CHAT_MODELS pool."""
-    if not OPENROUTER_API_KEY:
+    """Non-blocking AI for user chat. Tries primary chat key first, then all other keys."""
+    if not OPENROUTER_API_KEYS:
         return "AI is not configured."
 
-    for attempt in range(min(len(CHAT_MODELS), 15)):
-        model, _ = _get_next_model(CHAT_MODELS, "chat")
-        if not model:
-            await asyncio.sleep(2)
-            model, _ = _get_next_model(CHAT_MODELS, "chat")
-            if not model:
-                model = CHAT_MODELS[0]
+    # Build key order: chat key first, then all others
+    key_order = [OPENROUTER_API_KEYS[_chat_key_idx]]
+    for k in OPENROUTER_API_KEYS:
+        if k not in key_order:
+            key_order.append(k)
 
-        try:
-            async with httpx.AsyncClient(timeout=60) as client:
-                resp = await client.post(
-                    OPENROUTER_URL,
-                    headers={
-                        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "model": model,
-                        "messages": messages,
-                        "max_tokens": max_tokens,
-                        "temperature": 0.7,
-                    },
-                )
-                if resp.status_code == 429:
-                    _mark_limited(model, "chat")
-                    await asyncio.sleep(1)
-                    continue
-                resp.raise_for_status()
-                data = resp.json()
-                content = data.get("choices", [{}])[0].get("message", {}).get("content")
-                if content:
-                    log.info("Chat AI response from %s", model)
-                    return content.strip()
-                _mark_limited(model, "chat")
-        except Exception as e:
-            log.error("Chat AI error on %s: %s", model, e)
-            _mark_limited(model, "chat")
-            await asyncio.sleep(0.5)
+    for key in key_order:
+        for model in FREE_MODELS:
+            if not _is_available(key, model):
+                continue
+            result = await _try_request_async(key, model, messages, max_tokens, 0.7)
+            if result:
+                log.info("Chat response from key=...%s model=%s", key[-8:], model.split("/")[-1])
+                return result
+            await asyncio.sleep(0.3)
 
-    return ("I couldn't connect to the AI right now. All models are busy. "
-            "Please wait a minute and try again -- I have 26 models rotating!")
+    return ("All AI models are cooling down right now. "
+            "Please try again in about a minute -- I rotate through many models and accounts!")
 
 
 def chat_completion(messages: list[dict], max_tokens: int = 800) -> str:
-    """Blocking AI for scraper thread. Uses SCRAPER_MODELS pool."""
-    if not OPENROUTER_API_KEY:
+    """Blocking AI for scraper thread. Tries scraper key first, then all others."""
+    if not OPENROUTER_API_KEYS:
         return ""
 
-    for attempt in range(len(SCRAPER_MODELS)):
-        model, _ = _get_next_model(SCRAPER_MODELS, "scraper")
-        if not model:
-            time.sleep(10)
-            model, _ = _get_next_model(SCRAPER_MODELS, "scraper")
-            if not model:
-                return ""
+    key_order = [OPENROUTER_API_KEYS[_scraper_key_idx]]
+    for k in OPENROUTER_API_KEYS:
+        if k not in key_order:
+            key_order.append(k)
 
-        try:
-            with httpx.Client(timeout=30) as client:
-                resp = client.post(
-                    OPENROUTER_URL,
-                    headers={
-                        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "model": model,
-                        "messages": messages,
-                        "max_tokens": max_tokens,
-                        "temperature": 0.3,
-                    },
-                )
-                if resp.status_code == 429:
-                    _mark_limited(model, "scraper")
-                    time.sleep(5)
-                    continue
-                resp.raise_for_status()
-                data = resp.json()
-                content = data.get("choices", [{}])[0].get("message", {}).get("content")
-                if content:
-                    log.info("Scraper AI response from %s", model)
-                    return content.strip()
-                _mark_limited(model, "scraper")
-        except Exception as e:
-            log.error("Scraper AI error on %s: %s", model, e)
-            _mark_limited(model, "scraper")
-            time.sleep(2)
+    for key in key_order:
+        for model in FREE_MODELS:
+            if not _is_available(key, model):
+                continue
+            result = _try_request_sync(key, model, messages, max_tokens, 0.3)
+            if result:
+                log.info("Scraper response from key=...%s model=%s", key[-8:], model.split("/")[-1])
+                return result
+            time.sleep(0.5)
 
     return ""
 
@@ -254,7 +227,6 @@ Rules:
 
 
 def generate_ats_resume(user_data: dict) -> str:
-    """Blocking version for non-async contexts."""
     ud = user_data
     prompt = f"""Write a professional ATS-optimized resume. Structure:
 FULL NAME
