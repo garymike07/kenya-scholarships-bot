@@ -38,10 +38,10 @@ _key_limited = {}
 # Per (key:model) tracking for 404s / broken models
 _broken = {}
 _lock = threading.Lock()
+_chat_key_cursor = 0
 
 # Scraper ONLY uses the last key; chat uses all keys (scraper can't starve chat)
 _num_keys = len(OPENROUTER_API_KEYS)
-_chat_key_idx = 0
 _scraper_key_idx = max(0, _num_keys - 1)
 
 SYSTEM_PROMPT = """You are an AI assistant inside a Telegram bot for Kenyan citizens. You help with TWO things:
@@ -94,11 +94,21 @@ def _get_key_order(primary_idx: int) -> list[str]:
     return order
 
 
+def _get_chat_key_order() -> list[str]:
+    global _chat_key_cursor
+    if not OPENROUTER_API_KEYS:
+        return []
+    with _lock:
+        start_idx = _chat_key_cursor % len(OPENROUTER_API_KEYS)
+        _chat_key_cursor = (_chat_key_cursor + 1) % max(1, len(OPENROUTER_API_KEYS))
+    return _get_key_order(start_idx)
+
+
 async def async_chat_completion(messages: list[dict], max_tokens: int = 800) -> str:
     if not OPENROUTER_API_KEYS:
         return "AI is not configured."
 
-    key_order = _get_key_order(_chat_key_idx)
+    key_order = _get_chat_key_order()
 
     for key in key_order:
         if not _key_available(key):

@@ -9,9 +9,12 @@ class ScholarshipsKenyaScraper(BaseScraper):
     def scrape(self) -> list[Opportunity]:
         results = []
         session = self.get_session()
+        next_url = self.BASE
+        seen_pages = set()
 
-        for page_num in range(1, 50):
-            url = self.BASE if page_num == 1 else f"{self.BASE}/page/{page_num}/"
+        while next_url and next_url not in seen_pages:
+            url = next_url
+            seen_pages.add(url)
             try:
                 if not self.is_page_fresh(url):
                     log.debug("Skipping %s (already scraped)", url)
@@ -34,11 +37,13 @@ class ScholarshipsKenyaScraper(BaseScraper):
 
                 self.mark_page_done(url, count)
 
-                if not soup.select("a.next, .next.page-numbers"):
+                next_link = soup.select_one("a.next, .next.page-numbers")
+                next_url = next_link.get("href", "") if next_link else ""
+                if not next_url:
                     break
 
             except Exception as e:
-                log.error("scholarshipskenya page %d error: %s", page_num, e)
+                log.error("scholarshipskenya %s error: %s", url, e)
                 break
 
         return results

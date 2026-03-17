@@ -7,9 +7,9 @@ import logging
 log = logging.getLogger(__name__)
 
 RSS_FEEDS = [
-    ("https://www.grants.gov/rss/GG_NewOppByAgency.xml", "grants.gov-rss"),
+    ("https://www.scholars4dev.com/feed/", "scholars4dev-rss"),
+    ("https://www.opportunitiesforafricans.com/feed/", "opportunitiesforafricans-rss"),
     ("https://beta.nsf.gov/rss/rss_www_funding.xml", "nsf.gov"),
-    ("https://www.sba.gov/blogs.xml", "sba.gov"),
 ]
 
 
@@ -33,6 +33,11 @@ class RSSFeedScraper(BaseScraper):
                     headers={"User-Agent": "Mozilla/5.0 (compatible; GrantsBot/1.0)"},
                     timeout=30,
                 )
+                content_type = (resp.headers.get("content-type") or "").lower()
+                if not any(kind in content_type for kind in ["xml", "rss", "atom"]):
+                    log.warning("RSS feed %s returned non-feed content type: %s", feed_url, content_type)
+                    self.mark_page_done(feed_url, 0)
+                    continue
                 root = ElementTree.fromstring(resp.content)
                 ns = {"atom": "http://www.w3.org/2005/Atom"}
                 items = root.findall(".//item") or root.findall(".//atom:entry", ns)
@@ -58,4 +63,5 @@ class RSSFeedScraper(BaseScraper):
                 self.mark_page_done(feed_url, count)
             except Exception as e:
                 log.error("RSS feed %s error: %s", feed_url, e)
+                self.mark_page_done(feed_url, 0)
         return results

@@ -3,10 +3,27 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-OPENROUTER_API_KEYS = [
-    k.strip() for k in os.getenv("OPENROUTER_API_KEYS", "").split(",") if k.strip()
-]
-OPENROUTER_API_KEY = OPENROUTER_API_KEYS[0] if OPENROUTER_API_KEYS else os.getenv("OPENROUTER_API_KEY", "")
+def _load_openrouter_keys() -> list[str]:
+    keys = []
+    plural = os.getenv("OPENROUTER_API_KEYS", "")
+    singular = os.getenv("OPENROUTER_API_KEY", "")
+
+    if plural:
+        keys.extend(k.strip() for k in plural.split(",") if k.strip())
+    if singular:
+        keys.extend(k.strip() for k in singular.split(",") if k.strip())
+
+    deduped = []
+    seen = set()
+    for key in keys:
+        if key not in seen:
+            deduped.append(key)
+            seen.add(key)
+    return deduped
+
+
+OPENROUTER_API_KEYS = _load_openrouter_keys()
+OPENROUTER_API_KEY = OPENROUTER_API_KEYS[0] if OPENROUTER_API_KEYS else ""
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHANNEL_ID = int(os.getenv("TELEGRAM_CHANNEL_ID", "0"))
 DB_PATH = os.path.join(os.path.dirname(__file__), "data", "grants.db")

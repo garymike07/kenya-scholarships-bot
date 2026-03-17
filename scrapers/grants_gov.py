@@ -26,6 +26,10 @@ class GrantsGovScraper(BaseScraper):
                 timeout=30,
             )
             if resp.status_code != 200:
+                self.mark_page_done(api_url, 0)
+                if resp.status_code in {403, 404, 405}:
+                    log.warning("grants.gov API unavailable (%s), skipping for now", resp.status_code)
+                    return []
                 log.warning("grants.gov API returned %s, trying HTML fallback", resp.status_code)
                 return self._scrape_html()
 

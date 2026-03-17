@@ -15,22 +15,24 @@ from services.telegram_bot import build_app, post_to_channel
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler(os.path.join(os.path.dirname(__file__), "bot.log")),
-    ],
+    handlers=[logging.StreamHandler()],
+    force=True,
 )
 log = logging.getLogger(__name__)
 
 _scrape_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="scraper")
 
 
-async def scheduled_job(app):
-    log.info("Running scheduled scrape in background thread...")
+async def run_scrape_and_post(app, label: str = "Scheduled"):
+    log.info("%s scrape starting in background thread...", label)
     loop = asyncio.get_event_loop()
     new_count = await loop.run_in_executor(_scrape_executor, run_scrape_cycle)
-    log.info("Background scrape done: %d new opportunities", new_count)
+    log.info("%s scrape done: %d new opportunities", label, new_count)
     await post_to_channel(app)
+
+
+async def scheduled_job(app):
+    await run_scrape_and_post(app, "Scheduled")
 
 
 def main():
@@ -52,11 +54,8 @@ def main():
     async def post_init(application):
         scheduler.start()
         log.info("Scheduler started - scraping every %d minutes", SCRAPE_INTERVAL_MINUTES)
-        # Run initial scrape in background thread so bot is responsive immediately
-        loop = asyncio.get_event_loop()
-        loop.run_in_executor(_scrape_executor, run_scrape_cycle)
+        asyncio.create_task(run_scrape_and_post(application, "Initial"))
         log.info("Initial scrape started in background - bot is ready for chat!")
-        await post_to_channel(application)
 
     app.post_init = post_init
     app.run_polling(drop_pending_updates=True)

@@ -9,7 +9,6 @@ class Scholars4DevScraper(BaseScraper):
     PAGES = [
         "/tag/scholarships-for-kenyans/",
         "/category/country/africa-scholarships/",
-        "/category/country/developing-country-scholarships/",
         "/category/level/masters-scholarships/",
         "/category/level/phd-scholarships/",
         "/category/level/undergraduate-scholarships/",

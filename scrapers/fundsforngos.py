@@ -69,6 +69,10 @@ class FundsForNGOsScraper(BaseScraper):
                         break
 
             except Exception as e:
-                log.error("fundsforngos %s error: %s", page_path, e)
+                try:
+                    self.mark_page_done(url, 0)
+                except Exception:
+                    pass
+                log.warning("fundsforngos %s unavailable: %s", page_path, e)
 
         return results

@@ -26,6 +26,13 @@ CATEGORY_LABELS = {
     "nonprofit_funding": "Non-Profit Funding",
 }
 MAX_MSG_LEN = 4000
+GREETING_WORDS = {"hi", "hello", "hey", "yo", "good morning", "good afternoon", "good evening"}
+SEARCH_STOPWORDS = {
+    "a", "an", "and", "are", "for", "from", "help", "i", "in", "latest", "list", "looking",
+    "me", "need", "new", "of", "on", "please", "show", "tell", "that", "the", "to", "want",
+    "with", "find", "opportunity", "opportunities", "grant", "grants", "scholarship", "scholarships",
+    "funding", "fully", "funded",
+}
 
 
 def escape(text: str) -> str:
@@ -80,6 +87,39 @@ def split_message(text: str) -> list[str]:
     return chunks
 
 
+def normalize_user_text(text: str) -> str:
+    text = (text or "").strip()
+    if text.startswith("/"):
+        command, _, rest = text.partition(" ")
+        command = command.lstrip("/").split("@", 1)[0].replace("_", " ")
+        text = f"{command} {rest}".strip()
+    return text
+
+
+def search_tokens(text: str) -> list[str]:
+    tokens = re.findall(r"[a-zA-Z0-9+#-]+", text.lower())
+    return [token for token in tokens if len(token) > 2 and token not in SEARCH_STOPWORDS][:6]
+
+
+def detect_category(text: str) -> str | None:
+    lower = text.lower()
+    if any(word in lower for word in ["business", "startup", "entrepreneur", "sme", "seed fund"]):
+        return "business_grants"
+    if any(word in lower for word in ["ngo", "nonprofit", "non-profit", "charity", "community"]):
+        return "nonprofit_funding"
+    if any(word in lower for word in ["scholarship", "bursary", "masters", "phd", "undergraduate", "study"]):
+        return "student_scholarships"
+    return None
+
+
+def is_simple_greeting(text: str) -> bool:
+    lower = text.lower().strip()
+    if lower in GREETING_WORDS:
+        return True
+    words = lower.split()
+    return len(words) <= 3 and any(greet in lower for greet in GREETING_WORDS)
+
+
 async def send_full_message(bot, chat_id, text, reply_markup=None):
     import asyncio, re as _re
     parts = split_message(text)
@@ -118,11 +158,29 @@ async def send_opportunities(bot, chat_id, opps):
 
 async def do_search(bot, chat_id, keyword):
     from services.database import get_conn
+    keyword = keyword.strip()
+    tokens = search_tokens(keyword)
     conn = get_conn()
-    rows = conn.execute(
-        "SELECT * FROM opportunities WHERE title LIKE ? OR description LIKE ? OR summary LIKE ? ORDER BY posted_at DESC LIMIT 5",
-        (f"%{keyword}%", f"%{keyword}%", f"%{keyword}%")
-    ).fetchall()
+    rows = []
+    if tokens:
+        clauses = []
+        params = []
+        for token in tokens:
+            clauses.append(
+                "(lower(title) LIKE ? OR lower(description) LIKE ? OR lower(summary) LIKE ? OR lower(host_country) LIKE ? OR lower(level) LIKE ?)"
+            )
+            like = f"%{token}%"
+            params.extend([like, like, like, like, like])
+        rows = conn.execute(
+            f"SELECT * FROM opportunities WHERE {' OR '.join(clauses)} ORDER BY posted_at DESC LIMIT 5",
+            params,
+        ).fetchall()
+    if not rows and keyword:
+        like = f"%{keyword.lower()}%"
+        rows = conn.execute(
+            "SELECT * FROM opportunities WHERE lower(title) LIKE ? OR lower(description) LIKE ? OR lower(summary) LIKE ? ORDER BY posted_at DESC LIMIT 5",
+            (like, like, like),
+        ).fetchall()
     conn.close()
     if not rows:
         await bot.send_message(chat_id, f"No results for '{escape(keyword)}'. Try different keywords.", parse_mode="HTML")
@@ -130,6 +188,37 @@ async def do_search(bot, chat_id, keyword):
     await bot.send_message(chat_id, f"Found {len(rows)} result(s) for '<b>{escape(keyword)}</b>':", parse_mode="HTML")
     for row in rows:
         await send_full_message(bot, chat_id, format_opportunity_full(dict(row)))
+
+
+async def handle_local_request(bot, chat_id, text: str) -> bool:
+    lower = text.lower()
+
+    if is_simple_greeting(text):
+        await bot.send_message(
+            chat_id,
+            "Hi! I can help you find scholarships, grants, and funding opportunities, or help you build an ATS resume.",
+        )
+        return True
+
+    if any(phrase in lower for phrase in ["latest", "new scholarships", "recent scholarships", "show latest"]):
+        from services.database import get_conn
+        conn = get_conn()
+        rows = conn.execute("SELECT * FROM opportunities ORDER BY posted_at DESC LIMIT 5").fetchall()
+        conn.close()
+        await send_opportunities(bot, chat_id, [dict(r) for r in rows])
+        return True
+
+    category = detect_category(text)
+    if category and any(word in lower for word in ["browse", "category", "list", "show", "latest"]):
+        opps = get_opportunities_by_category(category, limit=5)
+        await send_opportunities(bot, chat_id, opps)
+        return True
+
+    if category:
+        await do_search(bot, chat_id, text)
+        return True
+
+    return False
 
 
 # ─── WELCOME ───
@@ -210,10 +299,13 @@ async def resume_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     register_user(user.id, user.username or "")
-    text = update.message.text.strip()
+    text = normalize_user_text(update.message.text)
     log.info("Message from %s (%s): %s", user.first_name, user.id, text[:100])
 
     if not text:
+        return
+
+    if await handle_local_request(context.bot, update.message.chat_id, text):
         return
 
     try:
@@ -252,6 +344,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     response = await async_chat_completion(history, max_tokens=1000)
     history.append({"role": "assistant", "content": response})
     context.user_data["chat_history"] = history
+
+    if response.startswith("All AI models are cooling down") or response == "AI is not configured.":
+        if await handle_local_request(context.bot, update.message.chat_id, text):
+            return
+        if any(word in text.lower() for word in ["resume", "cv"]):
+            await update.message.reply_text(
+                "The AI resume writer is temporarily busy. Please try again in a minute, or send more OpenRouter keys so I can increase capacity."
+            )
+            return
 
     # Parse AI actions from response
     clean_response = response
@@ -422,6 +523,7 @@ def build_app() -> Application:
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CallbackQueryHandler(resume_callback, pattern=r"^resume:"))
+    app.add_handler(MessageHandler(filters.COMMAND & ~filters.Regex(r"^/start(?:@\w+)?$"), handle_message))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
     return app

@@ -6,50 +6,40 @@ class AfterSchoolAfricaScraper(BaseScraper):
     name = "afterschoolafrica.com"
     BASE = "https://www.afterschoolafrica.com"
 
-    PAGES = [
-        "/category/scholarships/",
-        "/category/scholarships/fully-funded-scholarships/",
-        "/category/fellowships/",
-        "/category/grants/",
+    URLS = [
+        "https://www.afterschoolafrica.com/?s=scholarship",
+        "https://www.afterschoolafrica.com/fellowships/",
     ]
 
     def scrape(self) -> list[Opportunity]:
         results = []
         session = self.get_session()
 
-        for page_path in self.PAGES:
+        for url in self.URLS:
             try:
-                for page_num in range(1, 50):
-                    url = f"{self.BASE}{page_path}"
-                    if page_num > 1:
-                        url = f"{url}page/{page_num}/"
+                if not self.is_page_fresh(url):
+                    log.debug("Skipping %s (already scraped)", url)
+                    continue
 
-                    if not self.is_page_fresh(url):
-                        log.debug("Skipping %s (already scraped)", url)
-                        break
+                resp = self.polite_get(session, url)
+                soup = BeautifulSoup(resp.text, "lxml")
+                articles = soup.select("article, .post, .entry, .type-post")
 
-                    resp = self.polite_get(session, url)
-                    soup = BeautifulSoup(resp.text, "lxml")
-                    articles = soup.select("article, .post, .entry, .type-post")
+                if not articles:
+                    self.mark_page_done(url, 0)
+                    continue
 
-                    if not articles:
-                        self.mark_page_done(url, 0)
-                        break
+                count = 0
+                for article in articles:
+                    opp = self._parse_article(article)
+                    if opp and not any(r.url == opp.url for r in results):
+                        results.append(opp)
+                        count += 1
 
-                    count = 0
-                    for article in articles:
-                        opp = self._parse_article(article)
-                        if opp and not any(r.url == opp.url for r in results):
-                            results.append(opp)
-                            count += 1
-
-                    self.mark_page_done(url, count)
-
-                    if not soup.select("a.next, .next.page-numbers"):
-                        break
+                self.mark_page_done(url, count)
 
             except Exception as e:
-                log.error("afterschoolafrica %s error: %s", page_path, e)
+                log.error("afterschoolafrica %s error: %s", url, e)
 
         return results
 

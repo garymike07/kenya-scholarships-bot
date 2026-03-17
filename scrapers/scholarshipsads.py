@@ -6,21 +6,18 @@ class ScholarshipsAdsScraper(BaseScraper):
     name = "scholarshipsads.com"
     BASE = "https://www.scholarshipsads.com"
 
-    PAGES = [
-        "/tag/scholarships-in-kenya/",
-        "/tag/scholarships-for-african-students/",
-        "/tag/fully-funded-scholarships/",
-        "/blog/fully-funded-scholarships-for-kenyan-students-march2026",
+    SEARCH_URLS = [
+        "https://www.scholarshipsads.com/search?keyword=kenya",
+        "https://www.scholarshipsads.com/search?keyword=fully%20funded",
+        "https://www.scholarshipsads.com/search?keyword=masters",
     ]
 
     def scrape(self) -> list[Opportunity]:
         results = []
         session = self.get_session()
 
-        for page_path in self.PAGES:
+        for url in self.SEARCH_URLS:
             try:
-                url = f"{self.BASE}{page_path}" if not page_path.startswith("http") else page_path
-
                 if not self.is_page_fresh(url):
                     log.debug("Skipping %s (already scraped)", url)
                     continue
@@ -29,22 +26,23 @@ class ScholarshipsAdsScraper(BaseScraper):
                 soup = BeautifulSoup(resp.text, "lxml")
 
                 count = 0
-                for article in soup.select("article, .post, .entry, .type-post, .blog-item, .card"):
-                    opp = self._parse_article(article)
-                    if opp and not any(r.url == opp.url for r in results):
-                        results.append(opp)
-                        count += 1
-
-                for link in soup.select("a[href*='scholarship'], a[href*='fully-funded']"):
+                for link in soup.select("h3 a"):
                     href = link.get("href", "")
                     title = link.get_text(strip=True)
-                    if href and title and len(title) > 15 and not any(r.url == href for r in results):
-                        if not href.startswith("http"):
-                            href = self.BASE + href
+                    if not href or not title or len(title) < 15:
+                        continue
+                    if not href.startswith("http"):
+                        href = self.BASE + href
+                    if "/blog/categories/" in href or "/category/" in href:
+                        continue
+                    if not any(r.url == href for r in results):
+                        parent = link.find_parent(["div", "article", "section", "li"])
+                        description = parent.get_text(" ", strip=True)[:500] if parent else ""
                         results.append(Opportunity(
                             title=title,
                             url=href,
                             source=self.name,
+                            description=description,
                             raw_categories=["student_scholarships"],
                         ))
                         count += 1
@@ -52,29 +50,6 @@ class ScholarshipsAdsScraper(BaseScraper):
                 self.mark_page_done(url, count)
 
             except Exception as e:
-                log.error("scholarshipsads %s error: %s", page_path, e)
+                log.error("scholarshipsads %s error: %s", url, e)
 
         return results
-
-    def _parse_article(self, article) -> Opportunity | None:
-        title_el = article.select_one("h2 a, h3 a, .entry-title a, a.title")
-        if not title_el:
-            return None
-
-        title = title_el.get_text(strip=True)
-        href = title_el.get("href", "")
-        if not href or len(title) < 10:
-            return None
-        if not href.startswith("http"):
-            href = self.BASE + href
-
-        desc_el = article.select_one(".entry-content, .entry-summary, p, .excerpt")
-        description = desc_el.get_text(strip=True) if desc_el else ""
-
-        return Opportunity(
-            title=title,
-            url=href,
-            source=self.name,
-            description=description[:2000],
-            raw_categories=["student_scholarships"],
-        )
