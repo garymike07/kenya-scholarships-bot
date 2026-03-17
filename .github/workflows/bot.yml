@@ -1,0 +1,32 @@
+name: Telegram Bot (Webhook Mode)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  info:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Bot hosting info
+        run: |
+          echo "=============================================="
+          echo "  TELEGRAM BOT HOSTING OPTIONS"
+          echo "=============================================="
+          echo ""
+          echo "The Telegram bot (polling mode) needs a"
+          echo "long-running process. Free options:"
+          echo ""
+          echo "1. Railway.app   - Free tier, auto-deploy from GitHub"
+          echo "2. Render.com    - Free tier, auto-deploy from GitHub"
+          echo "3. Koyeb.com     - Free tier, Docker support"
+          echo "4. Fly.io        - Free tier, 3 VMs"
+          echo "5. Oracle Cloud  - Always-free ARM VM"
+          echo ""
+          echo "The SCRAPER runs hourly via GitHub Actions"
+          echo "(scrape.yml) for FREE with no hosting needed."
+          echo ""
+          echo "Set these GitHub Secrets:"
+          echo "  OPENROUTER_API_KEY"
+          echo "  TELEGRAM_TOKEN"
+          echo "  TELEGRAM_CHANNEL_ID"
+          echo "=============================================="

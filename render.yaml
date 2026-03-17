@@ -1,0 +1,13 @@
+services:
+  - type: worker
+    name: grants-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python3 main.py
+    envVars:
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: TELEGRAM_CHANNEL_ID
+        sync: false
