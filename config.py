@@ -29,6 +29,22 @@ TELEGRAM_CHANNEL_ID = int(os.getenv("TELEGRAM_CHANNEL_ID", "0"))
 DB_PATH = os.path.join(os.path.dirname(__file__), "data", "grants.db")
 SCRAPE_INTERVAL_MINUTES = 60
 
+CONVEX_SITE_URL = os.getenv("CONVEX_SITE_URL", "").rstrip("/")
+SITE_URL = os.getenv("SITE_URL", "").rstrip("/")
+
+SERVICES = {
+    "scholarship_finder": {
+        "name": "ScholarshipFinder Pro",
+        "tagline": "AI-powered scholarship & grant finder",
+        "access_prefix": "scholarship",
+    },
+    "resume_builder": {
+        "name": "ResumeBuilder AI",
+        "tagline": "ATS-optimized resume builder",
+        "access_prefix": "resume",
+    },
+}
+
 CATEGORIES = {
     "business_grants": [
         "business", "startup", "entrepreneur", "sme", "small business",

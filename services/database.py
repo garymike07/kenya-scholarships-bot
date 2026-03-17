@@ -1,9 +1,16 @@
 import sqlite3
 import os
 import time
-from config import DB_PATH
+import logging
+import httpx
+from config import DB_PATH, CONVEX_SITE_URL
+
+log = logging.getLogger(__name__)
 
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+
+_sub_cache: dict[str, dict] = {}
+_SUB_CACHE_TTL = 300
 
 
 def get_conn():
@@ -43,9 +50,23 @@ def init_db():
             last_reset_date TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS subscriptions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            service_type TEXT NOT NULL,
+            access_code TEXT UNIQUE,
+            status TEXT DEFAULT 'active',
+            expires_at REAL DEFAULT 0,
+            activated_at REAL,
+            source TEXT DEFAULT 'convex',
+            UNIQUE(user_id, service_type)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_opp_category ON opportunities(category);
         CREATE INDEX IF NOT EXISTS idx_opp_sent ON opportunities(sent_to_channel);
         CREATE INDEX IF NOT EXISTS idx_opp_url ON opportunities(url);
+        CREATE INDEX IF NOT EXISTS idx_sub_user ON subscriptions(user_id);
+        CREATE INDEX IF NOT EXISTS idx_sub_code ON subscriptions(access_code);
 
         CREATE TABLE IF NOT EXISTS scraped_pages (
             page_hash TEXT PRIMARY KEY,
@@ -60,25 +81,109 @@ def init_db():
             added_at REAL
         );
     """)
-    # Add columns if upgrading from old schema
-    try:
-        conn.execute("ALTER TABLE opportunities ADD COLUMN eligibility TEXT DEFAULT ''")
-    except:
-        pass
-    try:
-        conn.execute("ALTER TABLE opportunities ADD COLUMN host_country TEXT DEFAULT ''")
-    except:
-        pass
-    try:
-        conn.execute("ALTER TABLE opportunities ADD COLUMN level TEXT DEFAULT ''")
-    except:
-        pass
-    try:
-        conn.execute("ALTER TABLE opportunities ADD COLUMN benefits TEXT DEFAULT ''")
-    except:
-        pass
+    for col in ("eligibility", "host_country", "level", "benefits"):
+        try:
+            conn.execute(f"ALTER TABLE opportunities ADD COLUMN {col} TEXT DEFAULT ''")
+        except Exception:
+            pass
     conn.commit()
     conn.close()
+
+
+# ─── SUBSCRIPTION / ACCESS CONTROL ───
+
+def validate_access_code_remote(code: str) -> dict | None:
+    if not CONVEX_SITE_URL:
+        return None
+    cache_key = f"code:{code}"
+    cached = _sub_cache.get(cache_key)
+    if cached and cached["_ts"] > time.time() - _SUB_CACHE_TTL:
+        return cached
+
+    try:
+        resp = httpx.get(
+            f"{CONVEX_SITE_URL}/api/telegram/validate",
+            params={"code": code},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("valid"):
+                data["_ts"] = time.time()
+                _sub_cache[cache_key] = data
+                return data
+    except Exception as e:
+        log.warning("Convex validation failed for code %s: %s", code[:12], e)
+    return None
+
+
+def activate_subscription(user_id: int, service_type: str, access_code: str, expires_at: float):
+    conn = get_conn()
+    conn.execute("""
+        INSERT INTO subscriptions (user_id, service_type, access_code, status, expires_at, activated_at, source)
+        VALUES (?, ?, ?, 'active', ?, ?, 'convex')
+        ON CONFLICT(user_id, service_type) DO UPDATE SET
+            access_code = excluded.access_code,
+            status = 'active',
+            expires_at = excluded.expires_at,
+            activated_at = excluded.activated_at
+    """, (user_id, service_type, access_code, expires_at, time.time()))
+    conn.commit()
+    conn.close()
+    _sub_cache.pop(f"user:{user_id}:{service_type}", None)
+
+
+def has_active_subscription(user_id: int, service_type: str) -> bool:
+    cache_key = f"user:{user_id}:{service_type}"
+    cached = _sub_cache.get(cache_key)
+    if cached and cached["_ts"] > time.time() - _SUB_CACHE_TTL:
+        return cached["active"]
+
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT * FROM subscriptions WHERE user_id = ? AND service_type = ? AND status = 'active'",
+        (user_id, service_type)
+    ).fetchone()
+    conn.close()
+
+    active = False
+    if row:
+        if row["expires_at"] == 0 or row["expires_at"] > time.time():
+            active = True
+        else:
+            _expire_subscription(user_id, service_type)
+
+    _sub_cache[cache_key] = {"active": active, "_ts": time.time()}
+    return active
+
+
+def get_user_subscriptions(user_id: int) -> list[dict]:
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM subscriptions WHERE user_id = ? AND status = 'active'",
+        (user_id,)
+    ).fetchall()
+    conn.close()
+    now = time.time()
+    result = []
+    for r in rows:
+        d = dict(r)
+        if d["expires_at"] > 0 and d["expires_at"] <= now:
+            _expire_subscription(user_id, d["service_type"])
+            continue
+        result.append(d)
+    return result
+
+
+def _expire_subscription(user_id: int, service_type: str):
+    conn = get_conn()
+    conn.execute(
+        "UPDATE subscriptions SET status = 'expired' WHERE user_id = ? AND service_type = ?",
+        (user_id, service_type)
+    )
+    conn.commit()
+    conn.close()
+    _sub_cache.pop(f"user:{user_id}:{service_type}", None)
 
 
 def opportunity_exists(uid: str) -> bool:
