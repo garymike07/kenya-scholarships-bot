@@ -1,9 +1,10 @@
 """
-AI engine with 29 free OpenRouter models and automatic rotation on rate limits.
+AI engine with separate model pools for chat (priority) and scraper (background).
 """
 import httpx
 import asyncio
 import time
+import threading
 import logging
 from config import OPENROUTER_API_KEY
 
@@ -11,37 +12,52 @@ log = logging.getLogger(__name__)
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-FREE_MODELS = [
+# Chat gets the best models -- these are reserved for user-facing interactions
+CHAT_MODELS = [
     "nvidia/nemotron-3-super-120b-a12b:free",
-    "nvidia/nemotron-3-nano-30b-a3b:free",
-    "nvidia/nemotron-nano-12b-v2-vl:free",
-    "nvidia/nemotron-nano-9b-v2:free",
     "meta-llama/llama-3.3-70b-instruct:free",
-    "meta-llama/llama-3.2-3b-instruct:free",
     "google/gemma-3-27b-it:free",
-    "google/gemma-3-12b-it:free",
-    "google/gemma-3-4b-it:free",
-    "google/gemma-3n-e4b-it:free",
-    "google/gemma-3n-e2b-it:free",
-    "mistralai/mistral-small-3.1-24b-instruct:free",
     "qwen/qwen3-next-80b-a3b-instruct:free",
-    "qwen/qwen3-coder:free",
-    "qwen/qwen3-4b:free",
     "nousresearch/hermes-3-llama-3.1-405b:free",
     "openai/gpt-oss-120b:free",
-    "openai/gpt-oss-20b:free",
+    "mistralai/mistral-small-3.1-24b-instruct:free",
     "minimax/minimax-m2.5:free",
+    "nvidia/nemotron-3-nano-30b-a3b:free",
     "stepfun/step-3.5-flash:free",
-    "arcee-ai/trinity-large-preview:free",
-    "arcee-ai/trinity-mini:free",
-    "z-ai/glm-4.5-air:free",
-    "liquid/lfm-2.5-1.2b-instruct:free",
-    "cognitivecomputations/dolphin-mistral-24b-venice-edition:free",
     "openrouter/free",
+    "arcee-ai/trinity-large-preview:free",
+    "z-ai/glm-4.5-air:free",
+    "cognitivecomputations/dolphin-mistral-24b-venice-edition:free",
+    "google/gemma-3-12b-it:free",
+    "qwen/qwen3-coder:free",
+    "openai/gpt-oss-20b:free",
+    "nvidia/nemotron-nano-12b-v2-vl:free",
+    "google/gemma-3-4b-it:free",
+    "qwen/qwen3-4b:free",
+    "meta-llama/llama-3.2-3b-instruct:free",
+    "arcee-ai/trinity-mini:free",
+    "nvidia/nemotron-nano-9b-v2:free",
+    "google/gemma-3n-e4b-it:free",
+    "google/gemma-3n-e2b-it:free",
+    "liquid/lfm-2.5-1.2b-instruct:free",
 ]
 
-_model_idx = 0
-_rate_limited_models = {}
+# Scraper uses a small subset so it doesn't exhaust all models
+SCRAPER_MODELS = [
+    "qwen/qwen3-4b:free",
+    "meta-llama/llama-3.2-3b-instruct:free",
+    "google/gemma-3-4b-it:free",
+    "google/gemma-3n-e4b-it:free",
+    "liquid/lfm-2.5-1.2b-instruct:free",
+    "arcee-ai/trinity-mini:free",
+    "nvidia/nemotron-nano-9b-v2:free",
+    "google/gemma-3n-e2b-it:free",
+]
+
+_chat_idx = 0
+_scraper_idx = 0
+_rate_limited = {}
+_lock = threading.Lock()
 
 SYSTEM_PROMPT = """You are an AI assistant inside a Telegram bot for Kenyan citizens. You help with TWO things:
 
@@ -64,40 +80,47 @@ HOW TO BEHAVE:
 IMPORTANT: You MUST use the tags above when appropriate. They trigger actions in the bot."""
 
 
-def _get_next_model() -> str | None:
-    global _model_idx
+def _get_next_model(models: list, idx_name: str) -> tuple[str | None, int]:
+    global _chat_idx, _scraper_idx
     now = time.time()
-    tried = 0
-    while tried < len(FREE_MODELS):
-        model = FREE_MODELS[_model_idx % len(FREE_MODELS)]
-        blocked_until = _rate_limited_models.get(model, 0)
-        if now > blocked_until:
-            return model
-        _model_idx = (_model_idx + 1) % len(FREE_MODELS)
-        tried += 1
-    return FREE_MODELS[0]
+    with _lock:
+        idx = _chat_idx if idx_name == "chat" else _scraper_idx
+        for _ in range(len(models)):
+            model = models[idx % len(models)]
+            if _rate_limited.get(model, 0) < now:
+                return model, idx
+            idx = (idx + 1) % len(models)
+        if idx_name == "chat":
+            _chat_idx = idx
+        else:
+            _scraper_idx = idx
+    return None, idx
 
 
-def _mark_rate_limited(model: str):
-    global _model_idx
-    _rate_limited_models[model] = time.time() + 120
-    _model_idx = (_model_idx + 1) % len(FREE_MODELS)
-    log.warning("Rate limited on %s, rotating to next model", model)
+def _mark_limited(model: str, idx_name: str):
+    global _chat_idx, _scraper_idx
+    with _lock:
+        _rate_limited[model] = time.time() + 90
+        if idx_name == "chat":
+            _chat_idx = (_chat_idx + 1) % len(CHAT_MODELS)
+        else:
+            _scraper_idx = (_scraper_idx + 1) % len(SCRAPER_MODELS)
+    log.warning("Rate limited %s, rotating", model)
 
 
 async def async_chat_completion(messages: list[dict], max_tokens: int = 800) -> str:
-    """Non-blocking AI call for use in the Telegram bot's async handlers."""
+    """Non-blocking AI for Telegram bot handlers. Uses CHAT_MODELS pool."""
     if not OPENROUTER_API_KEY:
-        return "AI is not configured. Please set OPENROUTER_API_KEY."
+        return "AI is not configured."
 
-    attempts = 0
-    max_attempts = min(len(FREE_MODELS), 10)
-
-    while attempts < max_attempts:
-        model = _get_next_model()
+    for attempt in range(min(len(CHAT_MODELS), 15)):
+        model, _ = _get_next_model(CHAT_MODELS, "chat")
         if not model:
-            break
-        attempts += 1
+            await asyncio.sleep(2)
+            model, _ = _get_next_model(CHAT_MODELS, "chat")
+            if not model:
+                model = CHAT_MODELS[0]
+
         try:
             async with httpx.AsyncClient(timeout=60) as client:
                 resp = await client.post(
@@ -114,39 +137,40 @@ async def async_chat_completion(messages: list[dict], max_tokens: int = 800) -> 
                     },
                 )
                 if resp.status_code == 429:
-                    _mark_rate_limited(model)
+                    _mark_limited(model, "chat")
                     await asyncio.sleep(1)
                     continue
                 resp.raise_for_status()
                 data = resp.json()
                 content = data.get("choices", [{}])[0].get("message", {}).get("content")
                 if content:
-                    log.info("AI response from %s", model)
+                    log.info("Chat AI response from %s", model)
                     return content.strip()
-                _mark_rate_limited(model)
+                _mark_limited(model, "chat")
         except Exception as e:
-            log.error("AI error on %s: %s", model, e)
-            _mark_rate_limited(model)
+            log.error("Chat AI error on %s: %s", model, e)
+            _mark_limited(model, "chat")
             await asyncio.sleep(0.5)
 
-    return "I'm temporarily busy. Please try again in a minute -- I'll be right back!"
+    return ("I couldn't connect to the AI right now. All models are busy. "
+            "Please wait a minute and try again -- I have 26 models rotating!")
 
 
 def chat_completion(messages: list[dict], max_tokens: int = 800) -> str:
-    """Blocking version for use in synchronous scraper thread."""
+    """Blocking AI for scraper thread. Uses SCRAPER_MODELS pool."""
     if not OPENROUTER_API_KEY:
-        return "AI is not configured. Please set OPENROUTER_API_KEY."
+        return ""
 
-    attempts = 0
-    max_attempts = min(len(FREE_MODELS), 10)
-
-    while attempts < max_attempts:
-        model = _get_next_model()
+    for attempt in range(len(SCRAPER_MODELS)):
+        model, _ = _get_next_model(SCRAPER_MODELS, "scraper")
         if not model:
-            break
-        attempts += 1
+            time.sleep(10)
+            model, _ = _get_next_model(SCRAPER_MODELS, "scraper")
+            if not model:
+                return ""
+
         try:
-            with httpx.Client(timeout=60) as client:
+            with httpx.Client(timeout=30) as client:
                 resp = client.post(
                     OPENROUTER_URL,
                     headers={
@@ -157,87 +181,31 @@ def chat_completion(messages: list[dict], max_tokens: int = 800) -> str:
                         "model": model,
                         "messages": messages,
                         "max_tokens": max_tokens,
-                        "temperature": 0.7,
+                        "temperature": 0.3,
                     },
                 )
                 if resp.status_code == 429:
-                    _mark_rate_limited(model)
-                    time.sleep(1)
+                    _mark_limited(model, "scraper")
+                    time.sleep(5)
                     continue
                 resp.raise_for_status()
                 data = resp.json()
                 content = data.get("choices", [{}])[0].get("message", {}).get("content")
                 if content:
-                    log.info("AI response from %s", model)
+                    log.info("Scraper AI response from %s", model)
                     return content.strip()
-                _mark_rate_limited(model)
+                _mark_limited(model, "scraper")
         except Exception as e:
-            log.error("AI error on %s: %s", model, e)
-            _mark_rate_limited(model)
-            time.sleep(0.5)
+            log.error("Scraper AI error on %s: %s", model, e)
+            _mark_limited(model, "scraper")
+            time.sleep(2)
 
-    return "I'm temporarily busy. Please try again in a minute -- I'll be right back!"
-
-
-def generate_ats_resume(user_data: dict) -> str:
-    prompt = f"""Write a professional ATS-optimized resume based on this information.
-The resume MUST follow this exact structure:
-
-FULL NAME (centered, uppercase)
-Email | Phone | Location
-
-PROFESSIONAL SUMMARY
-(2-3 sentences summarizing qualifications)
-
-WORK EXPERIENCE
-Job Title - Company Name
-Dates
-* Achievement using action verbs and metrics
-* Achievement using action verbs and metrics
-
-EDUCATION
-Degree - Institution Name
-Dates
-
-SKILLS
-Skill 1, Skill 2, Skill 3
-
----
-User Information:
-Name: {user_data.get('name', 'Not provided')}
-Email: {user_data.get('email', 'Not provided')}
-Phone: {user_data.get('phone', 'Not provided')}
-Location: {user_data.get('location', 'Not provided')}
-Target Job: {user_data.get('target_job', 'Not provided')}
-Summary: {user_data.get('summary', 'Not provided')}
-Work Experience: {user_data.get('experience', 'Not provided')}
-Education: {user_data.get('education', 'Not provided')}
-Skills: {user_data.get('skills', 'Not provided')}
-
-Rules:
-- Use strong action verbs (Led, Managed, Developed, Achieved)
-- Include metrics where possible
-- No tables, columns, or graphics
-- Tailor keywords to the target job
-- Use - instead of em dashes
-- Output ONLY the resume text, no explanations"""
-
-    messages = [
-        {"role": "system", "content": "You are an expert resume writer. Output ONLY the resume text."},
-        {"role": "user", "content": prompt},
-    ]
-    return chat_completion(messages, max_tokens=1500)
+    return ""
 
 
 async def async_generate_ats_resume(user_data: dict) -> str:
-    """Non-blocking resume generation for Telegram bot handlers."""
-    # Reuse the same prompt from generate_ats_resume
-    prompt = generate_ats_resume.__code__.co_consts  # not worth duplicating
-    # Just call async version with same messages
-    from services.ai_chat import generate_ats_resume as _sync
-    # Build prompt inline
     ud = user_data
-    p = f"""Write a professional ATS-optimized resume based on this information.
+    prompt = f"""Write a professional ATS-optimized resume based on this information.
 The resume MUST follow this exact structure:
 
 FULL NAME (centered, uppercase)
@@ -280,6 +248,30 @@ Rules:
 
     messages = [
         {"role": "system", "content": "You are an expert resume writer. Output ONLY the resume text."},
-        {"role": "user", "content": p},
+        {"role": "user", "content": prompt},
     ]
     return await async_chat_completion(messages, max_tokens=1500)
+
+
+def generate_ats_resume(user_data: dict) -> str:
+    """Blocking version for non-async contexts."""
+    ud = user_data
+    prompt = f"""Write a professional ATS-optimized resume. Structure:
+FULL NAME
+Email | Phone | Location
+PROFESSIONAL SUMMARY
+WORK EXPERIENCE
+EDUCATION
+SKILLS
+
+User: Name={ud.get('name','')}, Email={ud.get('email','')}, Phone={ud.get('phone','')},
+Location={ud.get('location','')}, Target={ud.get('target_job','')},
+Summary={ud.get('summary','')}, Experience={ud.get('experience','')},
+Education={ud.get('education','')}, Skills={ud.get('skills','')}
+
+Output ONLY the resume text."""
+    messages = [
+        {"role": "system", "content": "Expert resume writer. Output ONLY resume text."},
+        {"role": "user", "content": prompt},
+    ]
+    return chat_completion(messages, max_tokens=1500)
