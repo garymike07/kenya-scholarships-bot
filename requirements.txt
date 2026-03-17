@@ -2,8 +2,9 @@ requests==2.32.3
 beautifulsoup4==4.13.3
 lxml==5.3.1
 python-dotenv==1.1.0
-python-telegram-bot==21.10
+python-telegram-bot==22.7
 apscheduler==3.11.0
 httpx==0.28.1
 aiosqlite==0.21.0
-feedparser==6.0.11
+fpdf2==2.8.7
+python-docx==1.2.0
