@@ -12,7 +12,10 @@ from services.database import (
     register_user, get_user_count,
     get_opportunities_by_category, get_unsent_opportunities, mark_sent
 )
-from services.ai_chat import chat_completion, generate_ats_resume, SYSTEM_PROMPT
+from services.ai_chat import (
+    chat_completion, generate_ats_resume, SYSTEM_PROMPT,
+    async_chat_completion, async_generate_ats_resume
+)
 from services.resume_export import export_pdf, export_docx, export_txt
 
 log = logging.getLogger(__name__)
@@ -242,7 +245,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(history) > 30:
         history = [history[0]] + history[-28:]
 
-    response = chat_completion(history, max_tokens=1000)
+    response = await async_chat_completion(history, max_tokens=1000)
     history.append({"role": "assistant", "content": response})
     context.user_data["chat_history"] = history
 
@@ -259,9 +262,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(update.message.chat_id, "✍️ Generating your ATS-optimized resume...")
         await context.bot.send_chat_action(update.message.chat_id, "typing")
 
-        resume_data = _extract_resume_data(history)
+        resume_data = await _async_extract_resume_data(history)
         context.user_data["resume_data"] = resume_data
-        resume_text = generate_ats_resume(resume_data)
+        resume_text = await async_generate_ats_resume(resume_data)
         context.user_data["generated_resume"] = resume_text
 
         await send_full_message(context.bot, update.message.chat_id, f"<pre>{escape(resume_text)}</pre>")
@@ -319,8 +322,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_full_message(context.bot, update.message.chat_id, escape(clean_response))
 
 
-def _extract_resume_data(history: list[dict]) -> dict:
-    """Extract resume fields from conversation history."""
+async def _async_extract_resume_data(history: list[dict]) -> dict:
+    """Extract resume fields from conversation history using async AI."""
     full_text = "\n".join(
         m["content"] for m in history
         if m["role"] == "user"
@@ -342,7 +345,6 @@ def _extract_resume_data(history: list[dict]) -> dict:
             if phones:
                 data["phone"] = phones[0].strip()
 
-    # Let AI extract structured data
     extract_prompt = f"""Extract resume information from this conversation. Return ONLY the data in this exact format (leave blank if not mentioned):
 
 name: 
@@ -359,7 +361,7 @@ Conversation:
 {full_text[-3000:]}"""
 
     messages = [{"role": "user", "content": extract_prompt}]
-    result = chat_completion(messages, max_tokens=800)
+    result = await async_chat_completion(messages, max_tokens=800)
 
     for line in result.split("\n"):
         if ":" in line:

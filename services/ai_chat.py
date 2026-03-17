@@ -2,6 +2,7 @@
 AI engine with 29 free OpenRouter models and automatic rotation on rate limits.
 """
 import httpx
+import asyncio
 import time
 import logging
 from config import OPENROUTER_API_KEY
@@ -84,7 +85,55 @@ def _mark_rate_limited(model: str):
     log.warning("Rate limited on %s, rotating to next model", model)
 
 
+async def async_chat_completion(messages: list[dict], max_tokens: int = 800) -> str:
+    """Non-blocking AI call for use in the Telegram bot's async handlers."""
+    if not OPENROUTER_API_KEY:
+        return "AI is not configured. Please set OPENROUTER_API_KEY."
+
+    attempts = 0
+    max_attempts = min(len(FREE_MODELS), 10)
+
+    while attempts < max_attempts:
+        model = _get_next_model()
+        if not model:
+            break
+        attempts += 1
+        try:
+            async with httpx.AsyncClient(timeout=60) as client:
+                resp = await client.post(
+                    OPENROUTER_URL,
+                    headers={
+                        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": model,
+                        "messages": messages,
+                        "max_tokens": max_tokens,
+                        "temperature": 0.7,
+                    },
+                )
+                if resp.status_code == 429:
+                    _mark_rate_limited(model)
+                    await asyncio.sleep(1)
+                    continue
+                resp.raise_for_status()
+                data = resp.json()
+                content = data.get("choices", [{}])[0].get("message", {}).get("content")
+                if content:
+                    log.info("AI response from %s", model)
+                    return content.strip()
+                _mark_rate_limited(model)
+        except Exception as e:
+            log.error("AI error on %s: %s", model, e)
+            _mark_rate_limited(model)
+            await asyncio.sleep(0.5)
+
+    return "I'm temporarily busy. Please try again in a minute -- I'll be right back!"
+
+
 def chat_completion(messages: list[dict], max_tokens: int = 800) -> str:
+    """Blocking version for use in synchronous scraper thread."""
     if not OPENROUTER_API_KEY:
         return "AI is not configured. Please set OPENROUTER_API_KEY."
 
@@ -127,7 +176,7 @@ def chat_completion(messages: list[dict], max_tokens: int = 800) -> str:
             _mark_rate_limited(model)
             time.sleep(0.5)
 
-    return "I'm temporarily busy. Please try again in a minute — I'll be right back!"
+    return "I'm temporarily busy. Please try again in a minute -- I'll be right back!"
 
 
 def generate_ats_resume(user_data: dict) -> str:
@@ -178,3 +227,59 @@ Rules:
         {"role": "user", "content": prompt},
     ]
     return chat_completion(messages, max_tokens=1500)
+
+
+async def async_generate_ats_resume(user_data: dict) -> str:
+    """Non-blocking resume generation for Telegram bot handlers."""
+    # Reuse the same prompt from generate_ats_resume
+    prompt = generate_ats_resume.__code__.co_consts  # not worth duplicating
+    # Just call async version with same messages
+    from services.ai_chat import generate_ats_resume as _sync
+    # Build prompt inline
+    ud = user_data
+    p = f"""Write a professional ATS-optimized resume based on this information.
+The resume MUST follow this exact structure:
+
+FULL NAME (centered, uppercase)
+Email | Phone | Location
+
+PROFESSIONAL SUMMARY
+(2-3 sentences summarizing qualifications)
+
+WORK EXPERIENCE
+Job Title - Company Name
+Dates
+* Achievement using action verbs and metrics
+
+EDUCATION
+Degree - Institution Name
+Dates
+
+SKILLS
+Skill 1, Skill 2, Skill 3
+
+---
+User Information:
+Name: {ud.get('name', 'Not provided')}
+Email: {ud.get('email', 'Not provided')}
+Phone: {ud.get('phone', 'Not provided')}
+Location: {ud.get('location', 'Not provided')}
+Target Job: {ud.get('target_job', 'Not provided')}
+Summary: {ud.get('summary', 'Not provided')}
+Work Experience: {ud.get('experience', 'Not provided')}
+Education: {ud.get('education', 'Not provided')}
+Skills: {ud.get('skills', 'Not provided')}
+
+Rules:
+- Use strong action verbs (Led, Managed, Developed, Achieved)
+- Include metrics where possible
+- No tables, columns, or graphics
+- Tailor keywords to the target job
+- Use - instead of em dashes
+- Output ONLY the resume text, no explanations"""
+
+    messages = [
+        {"role": "system", "content": "You are an expert resume writer. Output ONLY the resume text."},
+        {"role": "user", "content": p},
+    ]
+    return await async_chat_completion(messages, max_tokens=1500)
