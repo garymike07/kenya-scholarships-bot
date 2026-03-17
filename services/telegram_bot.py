@@ -78,18 +78,31 @@ def split_message(text: str) -> list[str]:
 
 
 async def send_full_message(bot, chat_id, text, reply_markup=None):
+    import asyncio, re as _re
     parts = split_message(text)
     for i, part in enumerate(parts):
         markup = reply_markup if i == len(parts) - 1 else None
-        try:
-            await bot.send_message(chat_id=chat_id, text=part, parse_mode="HTML",
-                                   disable_web_page_preview=True, reply_markup=markup)
-        except Exception:
+        for attempt in range(3):
             try:
-                await bot.send_message(chat_id=chat_id, text=part,
+                await bot.send_message(chat_id=chat_id, text=part, parse_mode="HTML",
                                        disable_web_page_preview=True, reply_markup=markup)
-            except Exception as e2:
-                log.error("Send failed: %s", e2)
+                break
+            except Exception as e:
+                err_str = str(e)
+                retry_match = _re.search(r'Retry in (\d+)', err_str)
+                if retry_match:
+                    wait = int(retry_match.group(1)) + 1
+                    log.warning("Flood control, waiting %ds...", wait)
+                    await asyncio.sleep(wait)
+                elif attempt < 2:
+                    try:
+                        await bot.send_message(chat_id=chat_id, text=part,
+                                               disable_web_page_preview=True, reply_markup=markup)
+                        break
+                    except Exception:
+                        await asyncio.sleep(2)
+                else:
+                    log.error("Send failed after retries: %s", e)
 
 
 async def send_opportunities(bot, chat_id, opps):
@@ -365,7 +378,8 @@ Conversation:
 async def post_to_channel(app: Application):
     if not TELEGRAM_CHANNEL_ID:
         return
-    opps = get_unsent_opportunities(limit=50)
+    import asyncio
+    opps = get_unsent_opportunities(limit=20)
     if not opps:
         return
     bot_info = await app.bot.get_me()
@@ -373,14 +387,16 @@ async def post_to_channel(app: Application):
         try:
             text = format_opportunity_full(opp)
             keyboard = [[InlineKeyboardButton(
-                "🤖 Chat with me for Scholarships + Free Resume Builder!",
+                "Chat with me for Scholarships + Free Resume Builder!",
                 url=f"https://t.me/{bot_info.username}"
             )]]
             await send_full_message(app.bot, TELEGRAM_CHANNEL_ID, text,
                                     reply_markup=InlineKeyboardMarkup(keyboard))
             mark_sent(opp["uid"])
+            await asyncio.sleep(3)
         except Exception as e:
             log.error("Channel post error: %s", e)
+            await asyncio.sleep(5)
 
 
 # ─── BUILD APP ───
